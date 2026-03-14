@@ -1,0 +1,161 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "Demo 1 - ECS con EC2: Orquestador nativo AWS con instancias EC2"
+
+Parameters:
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ecs/optimized-ami/amazon-linux-2023/recommended/image_id
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: demo1-ecs-ec2}]
+
+  IGW:
+    Type: AWS::EC2::InternetGateway
+  AttachIGW:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: {VpcId: !Ref VPC, InternetGatewayId: !Ref IGW}
+
+  SubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+  SubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+
+  RT:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref VPC}
+  Route:
+    Type: AWS::EC2::Route
+    DependsOn: AttachIGW
+    Properties: {RouteTableId: !Ref RT, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref IGW}
+  RTAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref SubnetA, RouteTableId: !Ref RT}
+  RTAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref SubnetB, RouteTableId: !Ref RT}
+
+  ALBSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0}
+  ECSSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS instances
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 0, ToPort: 65535, SourceSecurityGroupId: !Ref ALBSG}
+
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Subnets: [!Ref SubnetA, !Ref SubnetB]
+      SecurityGroups: [!Ref ALBSG]
+  TG:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties: {Port: 80, Protocol: HTTP, VpcId: !Ref VPC, TargetType: instance, HealthCheckPath: /}
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions: [{Type: forward, TargetGroupArn: !Ref TG}]
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties: {ClusterName: demo1-ecs-ec2}
+
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - {Effect: Allow, Principal: {Service: ec2.amazonaws.com}, Action: 'sts:AssumeRole'}
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref EC2Role]
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: t3.micro
+        IamInstanceProfile: {Arn: !GetAtt InstanceProfile.Arn}
+        SecurityGroupIds: [!Ref ECSSG]
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            echo "ECS_CLUSTER=${Cluster}" >> /etc/ecs/ecs.config
+
+  ASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      MinSize: '1'
+      MaxSize: '2'
+      DesiredCapacity: '1'
+      LaunchTemplate: {LaunchTemplateId: !Ref LaunchTemplate, Version: !GetAtt LaunchTemplate.LatestVersionNumber}
+      VPCZoneIdentifier: [!Ref SubnetA, !Ref SubnetB]
+
+  CP:
+    Type: AWS::ECS::CapacityProvider
+    Properties:
+      AutoScalingGroupProvider: {AutoScalingGroupArn: !Ref ASG}
+  CPAssoc:
+    Type: AWS::ECS::ClusterCapacityProviderAssociations
+    Properties:
+      Cluster: !Ref Cluster
+      CapacityProviders: [!Ref CP]
+      DefaultCapacityProviderStrategy: [{CapacityProvider: !Ref CP, Weight: 1}]
+
+  TaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: demo1-nginx
+      NetworkMode: bridge
+      RequiresCompatibilities: [EC2]
+      ContainerDefinitions:
+        - Name: nginx
+          Image: public.ecr.aws/nginx/nginx:latest
+          Memory: 256
+          PortMappings: [{ContainerPort: 80, HostPort: 0, Protocol: tcp}]
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: [Listener, CPAssoc]
+    Properties:
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDef
+      DesiredCount: 2
+      LaunchType: EC2
+      LoadBalancers:
+        - {ContainerName: nginx, ContainerPort: 80, TargetGroupArn: !Ref TG}
+
+Outputs:
+  URL:
+    Value: !Sub "http://${ALB.DNSName}"
+    Description: URL de NGINX en ECS con EC2
